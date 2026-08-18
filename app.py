@@ -125,13 +125,12 @@ def format_notification(status: str, extra: str = "", error: str = "", expiry_da
     return "\n".join(lines)
 
 # 等待Turnstile验证通过
-# 关键修复：必须检查隐藏字段 cf-turnstile-response 是否已有值（长度>50），
-# 仅凭页面文字判断不可靠（页面可能仍含 "verify you are human" 字样但验证已完成）。
+# 关键修复（2026-08-18 本地验证）：必须检查隐藏字段 cf-turnstile-response 是否已有值（长度>50），
+# 只认 response 有值才算通过。绝不能凭"页面不再显示验证提示/弹窗就绪"判断通过——
+# 那会导致假通过（点 Renew for 4 days 却根本没续上，到期日不变）。
 def wait_for_turnstile_pass(sb, timeout=30):
     start = time.time()
-    cf_indicators = ["verify you are human", "确认您是真人", "troubleshoot", "just a moment"]
     while time.time() - start < timeout:
-        # 方式1（可靠）：读取 cf-turnstile-response 隐藏字段值
         try:
             ts_len = sb.execute_script("""
                 (() => {
@@ -147,22 +146,8 @@ def wait_for_turnstile_pass(sb, timeout=30):
                 return True
         except Exception:
             pass
-        # 方式2（备选）：页面不再出现验证提示
-        try:
-            page_lower = sb.get_page_source().lower()
-            if not any(x in page_lower for x in cf_indicators):
-                # 再确认弹窗确实已打开
-                try:
-                    if sb.is_element_visible('button:contains("Renew for 4 days")') or \
-                       sb.is_element_visible('text=Renew your Free plan'):
-                        print("✅ Turnstile 验证已通过(弹窗就绪)")
-                        return True
-                except Exception:
-                    return True
-        except Exception:
-            pass
         sb.sleep(1)
-    print("❌ Turnstile 验证超时未通过")
+    print("❌ Turnstile 验证超时未通过（cf-turnstile-response 始终无有效值）")
     return False
     
 # 获取当前出口ip
