@@ -125,15 +125,42 @@ def format_notification(status: str, extra: str = "", error: str = "", expiry_da
     return "\n".join(lines)
 
 # 等待Turnstile验证通过
+# 关键修复：必须检查隐藏字段 cf-turnstile-response 是否已有值（长度>50），
+# 仅凭页面文字判断不可靠（页面可能仍含 "verify you are human" 字样但验证已完成）。
 def wait_for_turnstile_pass(sb, timeout=30):
     start = time.time()
     cf_indicators = ["verify you are human", "确认您是真人", "troubleshoot", "just a moment"]
     while time.time() - start < timeout:
-        page_lower = sb.get_page_source().lower()
-        if not any(x in page_lower for x in cf_indicators):
-            print("✅ Turnstile 验证已通过")
-            # sb.save_screenshot("turnstile_passed.png")
-            return True
+        # 方式1（可靠）：读取 cf-turnstile-response 隐藏字段值
+        try:
+            ts_len = sb.execute_script("""
+                (() => {
+                    const inputs = document.querySelectorAll('input[name="cf-turnstile-response"]');
+                    for (const inp of inputs) {
+                        if (inp.value && inp.value.length > 50) return inp.value.length;
+                    }
+                    return 0;
+                })()
+            """)
+            if ts_len and int(ts_len) > 50:
+                print(f"✅ Turnstile 通过! (response 长度: {ts_len})")
+                return True
+        except Exception:
+            pass
+        # 方式2（备选）：页面不再出现验证提示
+        try:
+            page_lower = sb.get_page_source().lower()
+            if not any(x in page_lower for x in cf_indicators):
+                # 再确认弹窗确实已打开
+                try:
+                    if sb.is_element_visible('button:contains("Renew for 4 days")') or \
+                       sb.is_element_visible('text=Renew your Free plan'):
+                        print("✅ Turnstile 验证已通过(弹窗就绪)")
+                        return True
+                except Exception:
+                    return True
+        except Exception:
+            pass
         sb.sleep(1)
     print("❌ Turnstile 验证超时未通过")
     return False
@@ -478,20 +505,37 @@ def main():
                 return
 
             # 处理弹窗中的 Turnstile
+            # 关键修复：必须等 cf-turnstile-response 有值才能点击续期按钮
             print("🔒 检测弹窗中的 Turnstile 验证...")
             turnstile_passed = False
             for attempt in range(1, 4):
                 try:
                     sb.uc_gui_click_captcha()
-                    time.sleep(12)
+                    time.sleep(10)
                 except Exception as e:
-                    print(f"⚠️ 点击 Turnstile 出错: {e}")
+                    print(f"⚠️ uc_gui_click_captcha 出错: {e}")
+                    # 备用：尝试 JS 点击 Turnstile 复选框
+                    try:
+                        print("  尝试 JS 点击 Turnstile iframe 复选框...")
+                        sb.execute_script("""
+                            (() => {
+                                const iframe = document.querySelector('iframe[src*="turnstile"]');
+                                if (iframe) {
+                                    const doc = iframe.contentDocument || iframe.contentWindow.document;
+                                    const cb = doc.querySelector('[role="checkbox"]');
+                                    if (cb) cb.click();
+                                }
+                            })()
+                        """)
+                        time.sleep(10)
+                    except Exception as e2:
+                        print(f"  JS 点 Turnstile 也失败: {e2}")
 
-                if wait_for_turnstile_pass(sb, timeout=20):
+                if wait_for_turnstile_pass(sb, timeout=25):
                     turnstile_passed = True
                     break
                 else:
-                    print(f"⏳ 第 {attempt} 次未通过，重试点击...")
+                    print(f"⏳ 第 {attempt} 次未通过，重试...")
 
             if not turnstile_passed:
                 print("❌ Turnstile 验证最终未通过，脚本退出")
@@ -499,16 +543,57 @@ def main():
                 return
 
             # 点击续期按钮
+            # 关键修复：必须用 force/JS 点击，弹窗 backdrop-blur 遮罩层会拦截普通 click
             print("⏳ 等待续期按钮可用并点击...")
-            time.sleep(5) 
+            time.sleep(3) 
+
+            # 检查按钮是否 disabled（Turnstile 未完成时按钮可能禁用）
+            for i in range(15):
+                try:
+                    btn_disabled = sb.execute_script("""
+                        (() => {
+                            const btn = document.querySelector('button:has-text("Renew for 4 days")');
+                            if (!btn) return 'not_found';
+                            return btn.disabled ? 'disabled' : 'enabled';
+                        })()
+                    """)
+                    if btn_disabled == 'enabled':
+                        print(f"  按钮已可用 (T+{i*2}s)")
+                        break
+                    elif btn_disabled == 'not_found':
+                        print(f"  按钮未找到 (T+{i*2}s)")
+                    else:
+                        print(f"  按钮仍禁用 (T+{i*2}s)")
+                except Exception:
+                    pass
+                time.sleep(2)
 
             modal_button_clicked = False
+            # 使用 JS 点击（绕过 backdrop 遮罩层拦截）
             try:
-                sb.click('button:contains("Renew for 4 days")', timeout=8)
+                sb.execute_script("""
+                    (() => {
+                        const btns = document.querySelectorAll('button');
+                        for (const btn of btns) {
+                            if (btn.textContent.includes('Renew for 4 days')) {
+                                btn.click();
+                                return 'clicked';
+                            }
+                        }
+                        return 'not_found';
+                    })()
+                """)
                 modal_button_clicked = True
-                print("✅ 已点击续期按钮")
+                print("✅ 已 JS 点击续期按钮")
             except Exception as e:
-                print(f"续期按钮点击失败: {e}")
+                print(f"JS 点击失败: {e}")
+                # 最后尝试 sb click
+                try:
+                    sb.click('button:contains("Renew for 4 days")', timeout=5)
+                    modal_button_clicked = True
+                    print("✅ sb.click 已点击续期按钮")
+                except Exception as e2:
+                    print(f"sb.click 也失败: {e2}")
 
             print("⏳ 等待新的过期时间...")
             sb.sleep(6)
